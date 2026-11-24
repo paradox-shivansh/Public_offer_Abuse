@@ -1,0 +1,28 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Downloaded PPA dataset
+rasje-osfstorage-*/
+
+# Generated outputs
+outputs/
+data/processed/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Temporary files
+*.log
+
+# Dataset CSV files
+order_test.csv
+order_train.csv
+edge.csv
+node.csv
