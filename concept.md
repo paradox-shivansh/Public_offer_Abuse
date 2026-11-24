@@ -1,368 +1,606 @@
-# Concepts: Understanding the Data and How the Project Works
+# Concept, Knowledge Base, Workflow and Code Explanation
 
-This document explains **what the data is, how it is structured, how the graph is built, and how each model works**, in plain language. Read it before the notebook if the pipeline feels like a black box.
+## 1. Project overview
 
-**Confidence legend** (used in the data sections):
+This notebook builds a promotion-abuse detection pipeline using both **tabular user information** and a **multi-relational user graph**. The central hypothesis is that an abusive account may not be distinguishable from a normal account by its own attributes alone. Relationships among accounts can provide additional evidence.
 
-| Mark | Meaning |
-|---|---|
-| ✅ Confirmed | Seen directly in the files or screenshots of this project |
-| 🔶 Inferred | Reasonable reading of the evidence; verify against the dataset's `readme.md` |
-| ❓ Verify | Not seen yet; the notebook auto-detects it, check the detection table |
+The task is formulated as **binary node classification**:
 
----
+- A user is represented by a graph node.
+- A relationship between two users is represented by an edge.
+- Edges may have different relation types.
+- A labelled node has target `1` (abuser) or `0` (normal).
+- A node without a known label is represented internally by `-1`. It can still participate in graph message passing.
 
-## 1. The big picture
+The notebook compares three models and combines their scores:
 
-### 1.1 What is promotion abuse?
+- Gaussian Naive Bayes (NB)
+- Histogram-based Gradient Boosting classifier (HistGradientBoosting / GBM)
+- Relation-aware GraphSAGE-style GNN
 
-A platform runs promotions (discounts, coupons, cashback) to attract ordinary customers. **Promotion abuse** is when people exploit them for profit. The PromoGuardian paper describes two main behaviours:
+The final weighted ensemble is selected using validation PR-AUC.
 
-* **Stocking up:** buying heavily discounted products in bulk, usually to resell.
-* **Cashback abuse:** fabricating transactions to claim incentives.
+## 2. Dataset and expected files
 
-Two things make it different from classic fraud such as stolen cards:
+The notebook is configured for the Meituan Public Promotion Abuse dataset (PPA), associated with the PromoGuardian paper.
 
-1. **The transactions look legitimate.** The abuser really buys real products; the fraud is the *pattern*.
-2. **It is organised in groups.** Accounts that abuse together tend to share things: a group chat, a coupon, a delivery point, a sales-dealer ("header").
+Expected files:
 
-So the question is not "is this single order strange?" but **"is this user tied into a suspicious cluster?"**
-
-### 1.2 How it relates to free-trial abuse
-
-Your original idea was someone using many emails to collect many free trials. It is the same structure:
-
-| Free-trial abuse | Promotion abuse (this dataset) |
-|---|---|
-| Many accounts, one person | Many accounts, one ring |
-| Shared device / IP / card | Shared group chat / coupon / dealer / address |
-| Looks like normal new signups | Looks like normal shoppers |
-| Detect by linking accounts | Detect by linking accounts |
-
-The method here transfers directly; only the relation types change.
-
----
-
-## 2. Anatomy of the dataset
-
-### 2.1 Files
-
-```
+```text
 rasje-osfstorage-archive/
-├── node.csv            users, one row per user
-├── edge.csv            connections between users
-├── readme.md           official description (read it!)
+├── readme.md
+├── node.csv
+├── edge.csv
 └── Transactions/
-    ├── order_train.csv   orders from week 1
-    └── order_test.csv    orders from week 2
+    ├── order_train.csv
+    └── order_test.csv
 ```
 
-The paper describes PPA as **two weeks of anonymised Meituan transactions**, with the **first week used for training and validation and the second week for testing**. The two order files match that exactly. ✅
+### 2.1 `node.csv`
 
-Reported scale (from the paper's description of PPA): millions of users, eight relation types, tens of millions of edges. 🔶 (Check Table 1 of the paper for exact numbers.)
+Contains user/node identifiers, a binary abuse label (or a label column that can be interpreted as binary), and possibly additional node attributes.
 
-### 2.2 Order files: `order_train.csv` and `order_test.csv` ✅
+The notebook attempts to detect:
 
-Each row is one **order line**. Columns seen in your screenshot:
+- Node ID column
+- Label column
+- Remaining node attributes
 
-| Column | Example | Meaning |
-|---|---|---|
-| `order_time` | `1000-05-25` | Order date. The **year is masked** (always `1000`); only month/day carry information |
-| `sku_id` | `39752` | Product identifier (SKU = stock keeping unit) |
-| `id` | `53861` | The **user** who placed the order 🔶 |
-| `r1` … `r8` | `506103.0`, `NaN` | The user's value for each of the **eight relation types** on that order. `NaN` means that relation does not apply to this order |
+The node ID and label are removed from the ordinary attribute matrix. If labels are stored separately, `EXTERNAL_LABEL_FILE`, `EXTERNAL_LABEL_ID_COL`, and `EXTERNAL_LABEL_COL` can be configured.
 
-Why `id` is a user 🔶: in the tail of your screenshot, user `87040` appears on two rows with identical `r1`, `r3`, `r8` values but different `sku_id`. Values that stay constant across a user's orders are exactly what a user-level attribute looks like.
+### 2.2 `edge.csv`
 
-The dates in your screenshot span `05-22` to `05-28`: one calendar week, consistent with "week 1 / week 2". Each file has roughly 21 million rows. ✅
+Contains relationships between users. The notebook supports three layouts:
 
-### 2.3 The eight relations (`r1` … `r8`)
+1. One relation column, such as `relation` or `edge_type`.
+2. Multiple binary/indicator columns named like `r1`, `r2`, etc.
+3. No detected relation information, in which case all edges are treated as one relation.
 
-Each `r_k` is an **anonymised identifier** for one kind of shared context. The paper names relation types such as group chat (inside the platform's app), promotion, coupon type, and the sales strategy for offline dealers. 🔶 The mapping of `r1…r8` to those names is *not* visible in the data, so the notebook just calls them `r1…r8`. The dataset's `readme.md` may list the order; if it does, rename them in your report.
+The source and destination endpoint columns are detected by common names or can be explicitly configured. The notebook treats edges as undirected by adding both directions to the graph representation.
 
-Key idea:
+### 2.3 Transaction files
 
-> **Two users with the same value in column `r_k` are linked through relation *k*.**
+The notebook expects weekly order data:
 
-Example (made-up numbers):
+- `order_train.csv`: week 1
+- `order_test.csv`: week 2
 
-| user (`id`) | `r1` | `r3` | `r6` |
-|---|---|---|---|
-| 101 | 777 | 55 | NaN |
-| 102 | 777 | 91 | NaN |
-| 103 | 777 | 55 | 12 |
-| 104 | 888 | 14 | NaN |
+The notebook's introductory documentation describes order time, SKU, user ID and relation identifiers (`r1`–`r8`). It streams large CSVs in chunks rather than loading all order rows into memory at once.
 
-Users 101, 102, 103 share `r1 = 777`, so they are connected through relation 1. Users 101 and 103 also share `r3 = 55`, so they have a second, stronger link. User 104 is isolated here.
+The exact meanings of relation fields should be taken from the dataset's own `readme.md`, not inferred from their names alone.
 
-### 2.4 `node.csv` ❓ (auto-detected)
+## 3. Core concepts
 
-Expected role: **one row per user**, containing the user identifier and the **fraud label** (1 = abuser, 0 = normal). It may also hold extra attributes. The notebook looks for an ID column and a label column by name and prints what it chose.
+### 3.1 Graph representation
 
-Things to check once you run it:
+A graph is written as:
 
-* Is the ID the same ID space as `id` in the order files? (The notebook warns if no transaction user matches.)
-* How are labels encoded, and are some users unlabelled (`NaN`)? Unlabelled users stay in the graph as context but are never used for training or testing.
+\[
+G=(V,E)
+\]
 
-### 2.5 `edge.csv` ❓ (auto-detected)
+where:
 
-Expected role: **pre-computed links between users**. Two layouts are supported:
+- \(V\) is the set of users.
+- \(E\) is the set of user-to-user relationships.
 
-1. Columns `src`, `dst`, plus **one relation column**, or
-2. Columns `src`, `dst`, plus **indicator columns `r1…r8`** (an edge belongs to relation *k* if `r_k` is non-empty / non-zero).
+A node can be connected to many other users. A relation-aware graph has separate edge sets:
 
-Edges are treated as **undirected** and de-duplicated; how many times a pair is linked is kept as a *multiplicity* (a pair linked many times is a stronger tie).
+\[
+E=E_1\cup E_2\cup\cdots\cup E_R
+\]
 
----
+where \(R\) is the number of relation types retained by preprocessing.
 
-## 3. From tables to a graph
+The adjacency matrix for relation \(r\) is \(A_r\). Its entry is non-zero when two nodes are connected through relation \(r\). A row-normalised adjacency matrix averages neighbour information:
 
-A **graph** has **nodes** (things) and **edges** (relationships between things).
+\[
+\widetilde A_r = D_r^{-1}A_r
+\]
 
-* **Nodes** = users.
-* **Edges** = "these two users share something", typed by relation.
-* **Node features** = a vector of numbers describing each user (their behaviour and their position in the graph).
-* **Node label** = abuser or not (known only for some users).
+where \(D_r\) is the diagonal matrix of row degrees. For a node with no neighbours under a relation, the corresponding sparse row contributes zero.
 
-```mermaid
-graph LR
-    A((Ana)) ---|coupon| B((Ben))
-    A ---|group chat| C((Cara))
-    B ---|coupon| C
-    B ---|dealer| D((Dev))
-    C ---|coupon| D
-    E((Eli)) ---|address| F((Fay))
+### 3.2 Why relation types matter
+
+A generic edge only says that two users are connected. A typed edge preserves *how* they are connected. Different relationships may carry different behavioural meaning. The GNN therefore aggregates neighbours separately for each relation type rather than mixing all neighbours into one average.
+
+### 3.3 Class imbalance
+
+Promotion abuse is expected to be less common than normal activity. A model that predicts every user as normal may still have high accuracy. Therefore, precision, recall, F1 and especially PR-AUC are more informative than accuracy alone.
+
+### 3.4 Temporal generalisation
+
+A random split estimates performance when future examples are drawn similarly to the observed population. A temporal split is closer to a deployment scenario: train using earlier activity and test on users first appearing later. It helps reveal whether a model generalises to new users rather than simply recognising users already observed in the training period.
+
+## 4. End-to-end workflow
+
+```text
+PPA dataset
+   |
+   +--> node.csv --------------------+
+   |                                |
+   +--> edge.csv --> clean/encode -->+--> user graph
+   |                                |       |
+   +--> order_train.csv ------------+       |
+   +--> order_test.csv --------------> weekly user features
+                                            |
+                          +-----------------+------------------+
+                          |                 |                  |
+                    Naive Bayes       HistGradientBoosting   Relational GNN
+                          |                 |                  |
+                          +-----------------+------------------+
+                                            |
+                              validation percentile scores
+                                            |
+                               validation-tuned weighted vote
+                                            |
+                              threshold / model selection
+                                            |
+                             held-out test evaluation
+                                            |
+                        metrics, analysis and saved artefacts
 ```
 
-Ana, Ben, Cara and Dev form a tightly knit cluster linked by several relation types. Eli and Fay share one tie only. The first cluster is far more suspicious: **high cohesion across several relations** is the fingerprint of an abuse ring.
+### Stage 1 — Environment and reproducibility
 
-### Why not just use a normal table?
+The first cells import Python libraries, set display options, set random seed `42`, and check whether PyTorch and CUDA are available. The device is set to CUDA when available and otherwise CPU.
 
-A tabular model sees each user as an independent row. It cannot know that Ben's three friends all abuse coupons. A graph model can pass that information along the edges. That extra context is the whole point of using a GNN.
+The seed improves repeatability but does not guarantee bit-for-bit identical GPU results across every environment.
 
----
+### Stage 2 — Configuration
 
-## 4. The train / validation / test split
+The configuration cell centralises paths, column overrides, data-size controls, split mode and model hyperparameters.
 
-Because the data covers two weeks, the project uses a **temporal split**, like real deployment:
+Important defaults in this notebook:
 
-| Set | Who | Used for |
-|---|---|---|
-| **Train** | Labelled users active in week 1 (75% of them) | Fitting the models |
-| **Validation** | The other 25% of week-1 users | Early stopping, ensemble weight, decision threshold |
-| **Test** | Labelled users who appear **only** in week 2 | Final report, touched once |
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `SEED` | 42 | Random seed |
+| `USE_TRANSACTIONS` | `True` | Build weekly transaction features |
+| `TX_CHUNK` | 2,000,000 | Rows read per transaction chunk |
+| `MAX_NODES` | 300,000 | Target maximum sampled graph size |
+| `PRESERVE_PREVALENCE` | `True` | Preserve the natural positive rate when sampling |
+| `MAX_RELATIONS` | 8 | Retain up to the configured number of relation categories |
+| `SPLIT_MODE` | `temporal` | Prefer time-based split |
+| `VAL_FRAC_OF_TRAIN` | 0.25 | Validation share of the week-1 training pool |
+| `HIDDEN` | 128 | GNN hidden width |
+| `N_LAYERS` | 2 | Number of relation-aware message-passing layers |
+| `DROPOUT` | 0.30 | GNN dropout |
+| `LR` | 0.005 | Adam learning rate |
+| `WEIGHT_DECAY` | 0.00001 | Adam weight decay |
+| `EPOCHS` | 300 | Maximum GNN epochs |
+| `PATIENCE` | 40 | Early-stopping patience |
 
-Why temporal and not random?
+`MAX_NODES=None` requests the full graph and can require substantial memory. `TX_MAX_ROWS` and `EDGE_NROWS` are intended for development runs, not final evaluation.
 
-* A random split lets the model see a user's near-identical neighbours during training, which flatters the score. A temporal split asks the question that matters in production: *"can a model trained on the past catch the abusers of next week?"*
-* Users active in **both** weeks are kept out of the test set so the same person cannot appear on both sides.
+### Stage 3 — Dataset inventory and loading
 
-Features for a week-2 test user come from `order_test.csv`; features for week-1 users come from `order_train.csv`. No label is ever used to build a feature.
+The notebook:
 
----
+1. Checks that the dataset directory exists.
+2. Lists files and approximate file sizes.
+3. prints the dataset's own `readme.md`.
+4. Loads `node.csv` and `edge.csv`.
+5. Displays shapes, memory use, sample rows and data types.
 
-## 5. Feature engineering
+The `read_table` helper checks whether the column headers look numeric. If so, it reloads the file without a header and assigns generic column names. This is a convenience heuristic; inspect the resulting columns to make sure the file was interpreted correctly.
 
-All features are computed **without labels**.
+### Stage 4 — Schema detection
 
-### 5.1 Behaviour features (from the order files)
+The helper `_norm` standardises column-name text. `find_col` searches likely exact names first, then common fragments.
 
-| Feature | Intuition |
-|---|---|
-| `tx_n_orders` | Abusers often order more than ordinary users |
-| `tx_active_days`, `tx_day_span` | Concentrated bursts versus spread-out shopping |
-| `tx_busiest_day_share` | Share of the week's orders placed on one day |
-| `tx_n_skus`, `tx_orders_per_sku` | Buying the same promoted product repeatedly (stocking up) |
-| `tx_r{k}_rate` | How often orders carry relation *k* at all |
+Detected fields include:
 
-### 5.2 Group-size features (the strongest signal)
+- Node ID and label
+- Edge source and destination
+- Edge relation, if available
+- Optional edge timestamp
 
-For every relation *k*, take every value the user used and count **how many distinct users used that same value** in the same week.
+If automatic detection is wrong, set the explicit override variables in the Configuration cell and rerun from the configuration/loading stage. The notebook stops if it cannot identify a label column.
 
-| Feature | Meaning |
-|---|---|
-| `tx_r{k}_grp_max` | Size of the biggest group the user belongs to under relation *k* |
-| `tx_r{k}_grp_mean` | Average group size across the user's values |
-| `tx_r{k}_n_values` | How many different values the user used |
+### Stage 5 — ID unification and label parsing
 
-Worked example: coupon value `777` is used by 40 distinct accounts in the week. Every one of those 40 users gets `grp_max = 40` for that relation. A normal user's values are shared by 1 to 3 others. A big number means "this user sits inside a crowd that shares one attribute".
+Node IDs from the node table and both edge endpoints are converted to one common representation. The notebook creates a unified index containing IDs from all three locations.
 
-### 5.3 Graph-structure features
+This is important because an endpoint may appear in `edge.csv` without a corresponding row in `node.csv`. Such a user is retained as an **unlabelled graph node** rather than discarded.
 
-| Feature | Meaning |
-|---|---|
-| `g_degree` | Number of distinct neighbours |
-| `g_weighted_degree`, `g_avg_multiplicity` | Total link count; how often the same pair is re-linked |
-| `g_n_active_relations` | How many of the 8 relation types the user participates in |
-| `g_degree_rel_*` | Degree separately for each relation |
-| `g_neighbor_mean_degree` | How well-connected the user's neighbours are |
-| `nbr_mean_*` | Average of the **most discriminative features** over a user's neighbours (selected on the training set only) |
+The compact graph index maps each original user ID to an integer in:
 
-### 5.4 Preprocessing
+\[
+\{0,1,\ldots,N-1\}
+\]
 
-* Count-like columns get `log1p` (`log(1 + x)`), because counts are heavily skewed: most users have 2 orders, a few have 2,000.
-* Naive Bayes gets a **QuantileTransformer** (turns any distribution into a bell shape).
-* The GNN gets standardised features (mean 0, std 1, clipped at ±5), with the scaler fitted on **training nodes only**.
+Labels are parsed into:
 
----
+- `1`: positive / abuse
+- `0`: negative / normal
+- `-1`: unknown, missing or unsupported label
 
-## 6. The models
+The text parser recognises common positive and negative words as well as numeric 0/1 values. Check the printed raw label counts if the mapping looks unexpected.
 
-### 6.1 Gaussian Naive Bayes (Model A)
+### Stage 6 — Relation encoding and edge cleaning
 
-Naive Bayes asks: *given this user's features, is "abuser" or "normal" more likely?* It uses Bayes' rule and assumes features are independent given the class:
+The notebook handles the three edge layouts described earlier. If there are many relation categories in a single relation column, it keeps frequent categories up to the configured limit and merges the remainder into `other`.
 
-```
-log-odds(abuser) = log P(abuser)/P(normal)  +  Σ over features  log p(x_i | abuser) / p(x_i | normal)
-```
+For indicator columns, a row can produce an edge for each active relation indicator. Edges with no active relation indicator can be assigned to `other`.
 
-Each feature votes for or against "abuser", and the votes are added. "Gaussian" means each feature's distribution per class is modelled as a bell curve.
+Self-loops are removed. The graph is treated as undirected by adding reverse edges. Duplicate edges are consolidated in the sparse adjacency representation. The resulting relation-specific adjacency matrices are used for structural features and GNN message passing.
 
-* **Strengths:** very fast, works with few positives, hard to overfit, easy to explain.
-* **Weakness:** the "naive" independence assumption is false here (many features are correlated), and it looks at each user alone. The structural and neighbourhood features partly compensate.
+### Stage 7 — Transaction aggregation
 
-The notebook uses the **log-odds** directly instead of probabilities, because Naive Bayes probabilities saturate at exactly 0 or 1 and lose ranking information.
+Large order files are processed in chunks using `aggregate_orders(path, tag, nrows=None)`. The function is designed to produce user-level summaries for each week and cache them under `outputs/` so repeated notebook runs do not have to repeat the expensive aggregation unless `FORCE_RECOMPUTE_TX=True`.
 
-### 6.2 Relation-aware GraphSAGE (Model B)
+The transaction pipeline uses the user's own order activity and relation values to construct behavioural and shared-group information. These are later aligned to the unified graph node index.
 
-A **Graph Neural Network** learns a vector for each user by repeatedly **mixing in information from neighbours** ("message passing").
+The notebook documentation identifies fields such as order time, SKU, user ID and relation columns `r1`–`r8`. Exact feature definitions should be verified in the aggregation cell and against the dataset README before describing a specific feature as a domain fact.
 
-One layer, for user *i*:
+**Temporal feature rule:** week-1 features belong to the training period; week-2 features belong to the later period. Do not accidentally combine future-period behaviour into training features when adapting the pipeline.
 
-```
-new_vector(i) = activation( W · [ own_vector(i)  ||  mean of neighbours via relation 1
-                                               ||  mean of neighbours via relation 2
-                                               ||  ...
-                                               ||  mean of neighbours via relation 8 ] )
-```
+### Stage 8 — Graph sub-sampling
 
-* `||` means "concatenate side by side".
-* Neighbours are averaged **separately per relation**, so the network can learn that "shares a coupon with a crowd" differs from "shares a dealer".
-* **Two layers** means a user is influenced by neighbours *and neighbours-of-neighbours* (two hops).
-* The final layer outputs one number per user: the abuser score.
+The full graph can be too large for in-memory training. When the node count exceeds `MAX_NODES`, `subsample_nodes` selects labelled seed users and includes their neighbours, then retains the induced subgraph.
+
+Keeping neighbours is important: an unlabelled node can still provide useful context to a labelled node during message passing.
+
+`PRESERVE_PREVALENCE=True` aims to retain the natural class prevalence in the sampled labelled population. If prevalence is not preserved, reported precision and related metrics may not represent the original dataset distribution.
+
+After sampling, node indices, edge endpoints and transaction features are remapped to the smaller graph.
+
+### Stage 9 — Train / validation / test split
+
+The preferred `temporal` mode uses:
+
+- **Training + validation pool:** labelled users active in week 1.
+- **Test:** labelled users present in week 2 but not in week 1.
+- **Validation:** a stratified share of the week-1 pool, controlled by `VAL_FRAC_OF_TRAIN`.
+
+The notebook includes a fallback called `temporal_disjoint` when the strict “new users in week 2” test population is too small (the code uses a minimum-positive check). The fallback partitions users across the available temporal activity groups to obtain a usable evaluation set.
+
+The alternative `random` mode uses stratified random train/validation/test partitions controlled by `TRAIN_FRAC` and `VAL_FRAC`. This is easier but less representative of future-user prediction.
+
+**Important:** the actual split mode is stored in `mode` and written to `run_config.json`. Report the mode that actually ran, not merely the requested configuration.
+
+### Stage 10 — Feature engineering
+
+The notebook builds four feature families.
+
+#### A. Node attributes
+
+All usable columns in `node.csv` other than the node ID and label are considered. Categorical and numeric values are processed into a numeric representation; missing values and feature scaling are handled in the feature-building code.
+
+#### B. Behaviour / group features
+
+Per-user transaction summaries are aligned to graph nodes. These capture individual activity and shared-relation patterns derived from the weekly order data.
+
+#### C. Graph-structure features
+
+The notebook calculates graph information such as:
+
+- Total degree
+- Degree by relation
+- Edge/relation multiplicity or counts
+- Mean neighbour degree
+- Neighbourhood averages of selected behavioural features
+
+The neighbourhood averages use sparse matrix operations. This lets a node inherit contextual information from its connected users without explicitly looping through every neighbour in Python.
+
+#### D. Label-aware neighbour features (GBM only)
+
+The notebook can add counts of *known training-set* positive and negative neighbours, including relation-specific counts, plus a smoothed positive-neighbour share.
+
+For a node \(i\), the overall positive-neighbour count can be represented as:
+
+\[
+c_i^+ = \sum_j A_{ij}\mathbb{1}(j\in T^+)
+\]
+
+and the negative-neighbour count as:
+
+\[
+c_i^- = \sum_j A_{ij}\mathbb{1}(j\in T^-)
+\]
+
+where \(T^+\) and \(T^-\) are positive and negative training nodes only.
+
+A smoothed share is calculated in the code using the training prior:
+
+\[
+s_i = \frac{c_i^+ + \pi}{c_i^+ + c_i^- + 1}
+\]
+
+where \(\pi\) is the positive rate in the training labels.
+
+These label-aware features are supplied to the boosting model only. Validation/test labels are not used to construct them. They are not supplied to the GNN, avoiding label information being passed through message passing.
+
+#### Feature scaling
+
+The raw feature matrix is retained for Naive Bayes. A `StandardScaler` is fitted on training nodes and used to prepare clipped, standardised GNN inputs. The QuantileTransformer for Naive Bayes is also fitted on training nodes only.
+
+This train-only fitting prevents validation/test distribution information from influencing fitted preprocessing parameters.
+
+### Stage 11 — Model A: Gaussian Naive Bayes
+
+Naive Bayes applies Bayes' theorem with a conditional-independence assumption:
+
+\[
+P(y\mid x_1,\ldots,x_d)
+\propto P(y)\prod_{k=1}^{d}P(x_k\mid y)
+\]
+
+Gaussian Naive Bayes models each feature/class conditional distribution as Gaussian:
+
+\[
+x_k\mid y=c \sim \mathcal N(\mu_{kc},\sigma_{kc}^2)
+\]
+
+The notebook first uses a `QuantileTransformer` with `output_distribution="normal"` to make heavily skewed count features more compatible with Gaussian assumptions. It is fitted only on training data.
+
+The classifier uses `var_smoothing=1e-6`. Its output is represented as a log-odds score:
+
+\[
+s_{NB} = \log P(y=1\mid x)-\log P(y=0\mid x)
+\]
+
+**Role:** a fast baseline that can work with relatively little positive data. Its limitation is that it does not learn graph message passing; graph information only reaches it through engineered features.
+
+### Stage 12 — Model C: HistGradientBoosting
+
+The tabular boosting model is `HistGradientBoostingClassifier`. Gradient boosting builds an additive collection of decision trees, where later trees correct residual errors made by earlier trees.
+
+The configured model uses:
+
+- `learning_rate=0.06`
+- `max_iter=800`
+- `max_leaf_nodes=31`
+- `min_samples_leaf=40`
+- `l2_regularization=1.0`
+- `class_weight="balanced"`
+- early stopping
+
+It receives the engineered feature matrix plus optional label-aware training-neighbour features. Its decision function supplies the model score.
+
+**Role:** learn non-linear feature interactions and behavioural patterns from tabular and engineered graph features.
+
+### Stage 13 — Model B: relation-aware GraphSAGE
+
+The GNN is implemented directly in PyTorch; it does not require PyTorch Geometric or DGL.
+
+For node \(i\) at layer \(l\), the model concatenates:
+
+- Its current representation \(h_i^{(l)}\)
+- The mean representation of neighbours under relation 1
+- The mean representation of neighbours under relation 2
+- …
+- The mean representation of neighbours under relation \(R\)
+
+The layer update is:
+
+\[
+h_i^{(l+1)} =
+\sigma\left(
+W^{(l)}
+\left[
+h_i^{(l)}
+\;\|\;
+\operatorname{mean}_{j\in N_1(i)}h_j^{(l)}
+\;\|\;\cdots\|\;
+\operatorname{mean}_{j\in N_R(i)}h_j^{(l)}
+\right]
+\right)
+\]
+
+Here:
+
+- \(N_r(i)\) is the set of neighbours of node \(i\) through relation \(r\).
+- \(\|\) means concatenation.
+- \(W^{(l)}\) is a learned linear transformation.
+- \(\sigma\) is ReLU on hidden layers.
+- The final layer produces one logit per node.
+
+Each relation's adjacency matrix is stored as a sparse PyTorch tensor. Neighbour aggregation uses `torch.sparse.mm`, which avoids converting the graph into a dense matrix.
 
 Training details:
 
-| Choice | Reason |
+- Optimiser: Adam
+- Loss: `BCEWithLogitsLoss`
+- Positive class weighting: based on the training class ratio, clipped to a maximum of 50
+- Dropout: configured by `DROPOUT`
+- Early stopping: validation PR-AUC with `PATIENCE`
+- Best model state: the epoch with the highest validation PR-AUC
+
+Unlabelled nodes are assigned a placeholder target only to create a tensor of the right shape; the loss is calculated on `tr_idx` only. They therefore contribute graph context without contributing supervised loss.
+
+**Full-batch limitation:** each epoch performs message passing over the complete sampled graph. This is convenient for a moderate graph but may not fit a graph with millions of nodes. Neighbour sampling or mini-batch graph training would be needed for that scale.
+
+### Stage 14 — Score normalisation and ensemble
+
+The models output scores on different scales. The notebook converts each model's scores to percentile ranks using the validation scores as the reference distribution.
+
+For reference scores \(S_{val}\), the empirical percentile of a score \(s\) is:
+
+\[
+r(s)=\frac{1}{|S_{val}|}\sum_{v\in S_{val}}\mathbb{1}(v\leq s)
+\]
+
+The weighted ensemble is:
+
+\[
+S_{ens}=w_{GNN}r_{GNN}+w_{GBM}r_{GBM}+w_{NB}r_{NB}
+\]
+
+with:
+
+\[
+w_{GNN}+w_{GBM}+w_{NB}=1,\qquad w_k\geq 0
+\]
+
+The notebook searches a grid of weights in increments of 0.1 and chooses the combination with the best validation PR-AUC.
+
+It also trains an optional stacked logistic-regression model using the three model scores and validation labels. Because the stacker is fitted on the validation set, its validation performance is not an unbiased estimate; the held-out test set remains the final evaluation.
+
+### Stage 15 — Threshold selection and evaluation
+
+For each model score, `best_threshold` selects the validation threshold that maximises F1. That threshold is then applied to test scores.
+
+The notebook reports:
+
+| Metric | Interpretation |
 |---|---|
-| **Full-batch** training | Simple; the graph fits in memory after sampling |
-| **Class-weighted loss** (`pos_weight` = normal/abuser ratio, capped at 50) | Counteracts the heavy imbalance so the model does not just predict "normal" |
-| **Early stopping on validation PR-AUC** | Stops before the model memorises the training users |
-| **Dropout 0.3, weight decay** | Regularisation |
+| Precision | Of flagged users, fraction labelled abuse |
+| Recall | Of labelled abusers, fraction detected |
+| F1 | Harmonic mean of precision and recall |
+| PR-AUC | Area under precision-recall curve / average precision |
+| ROC-AUC | Area under ROC curve |
+| Accuracy | Overall fraction correct; potentially misleading under imbalance |
+| Balanced accuracy | Mean of sensitivity and specificity |
+| Lift | Precision divided by test positive-class prevalence |
+| Precision@K | Precision among top K scores, with K equal to the number of test positives |
+| Flagged | Number of test users above the validation threshold |
 
-Only **features and graph structure** flow through the network. Neighbours' *labels* are never used as inputs, so there is no label leakage.
+The notebook also plots:
 
-### 6.3 The ensemble
+- Test precision-recall curves
+- Confusion matrix for the selected model
+- Score distributions for normal and abusive test users
+- Feature effect sizes
+- Permutation importance for the boosting model
 
-The two models disagree in useful ways: Naive Bayes is good at per-user behaviour; the GNN adds neighbourhood context.
+The final model is selected by **validation PR-AUC**, not by test performance. The test set is intended to remain a held-out report card.
 
-1. Their raw scores live on different scales, so each is converted to a **percentile rank** (0 to 1) using the validation set as reference.
-2. **Weighted soft vote:** `score = w · GNN + (1 − w) · NB`. `w` is chosen on validation. One number to tune means little room to overfit.
-3. **Stacked variant:** a small logistic regression learns how to combine the two raw scores. It is fitted on the validation set, so judge it on the test set only.
+### Stage 16 — Error analysis
 
-### 6.4 Choosing the decision threshold
+The notebook examines:
 
-A score is not yet a yes/no decision. For each model the threshold is the value that maximises **F1 on the validation set**, then it is applied unchanged to the test set. (Choosing it on the test set would be cheating.) In a real company you would instead pick it from the business trade-off: the cost of a lost promotion versus the cost of blocking a genuine customer.
+- Standardised mean differences between positive and negative training users
+- Permutation importance on a validation sample
+- Highest-scoring test users
+- Missed positive users and their graph degree
 
----
+The notebook notes that users with few connections may be harder for a graph model to identify because they provide less neighbourhood context. This is a diagnostic observation, not a guarantee about every missed case.
 
-## 7. Evaluation, and why accuracy is a trap
+### Stage 17 — Saving outputs
 
-Suppose the test set has 10,000 users and 100 abusers (1%).
+The notebook writes:
 
-* A model that **always predicts "normal"** is **99% accurate** and catches **zero** abusers.
+- `outputs/model_comparison.csv`
+- `outputs/test_predictions.csv`
+- `outputs/gnn_best.pt`
+- `outputs/naive_bayes.joblib`
+- `outputs/gradient_boosting.joblib`
+- `outputs/run_config.json`
 
-So the project reports:
+Transaction aggregation also uses cached feature files in `outputs/` so the large CSV files need not be reprocessed on every run.
 
-| Metric | Question it answers |
-|---|---|
-| **Precision** | Of the users we flagged, how many were really abusers? (Low precision means angry customers wrongly blocked.) |
-| **Recall** | Of all real abusers, how many did we catch? (Low recall means money still lost.) |
-| **F1** | Harmonic mean of precision and recall |
-| **PR-AUC** | Quality across *all* thresholds; the main metric for rare events. A random model scores about the abuser rate (here 0.01), not 0.5 |
-| **ROC-AUC** | Ranking quality across thresholds; can look flattering when positives are rare |
-| **Precision@K** | Precision among the K highest-scored users, K = number of real abusers |
+The run configuration records the actual split mode, graph size, feature count, relation names, detected columns, sampling settings, GNN parameters, ensemble weights and selected model.
 
-Worked example: the model flags 90 users and 72 are real abusers.
+## 5. Leakage prevention — what is protected and what to verify
 
-```
-Precision = 72 / 90  = 0.80
-Recall    = 72 / 100 = 0.72
-F1        = 2 · 0.80 · 0.72 / (0.80 + 0.72) ≈ 0.76
-```
+Leakage occurs when information unavailable at prediction time influences training or evaluation.
 
-**A warning about sub-sampling.** If `PRESERVE_PREVALENCE = False`, the sample contains a higher share of abusers than reality, which makes precision look better than it would be in production. Report that setting honestly.
+The notebook includes several controls:
 
----
+1. The temporal split aims to keep week-2-only users in the test set.
+2. Users active in both weeks are excluded from the strict new-user test group.
+3. Scalers and the Naive Bayes quantile transformer are fitted on training nodes.
+4. Label-aware neighbour features use training labels only.
+5. Label-aware neighbour features are not fed to the GNN.
+6. The GNN's supervised loss is calculated on training indices only.
+7. Ensemble weights and classification thresholds are selected on validation data.
+8. The final model choice is based on validation PR-AUC.
 
-## 8. How the notebook flows
+**Important audit point:** graph topology and feature timing still need to match the intended real-world prediction moment. If the graph includes relationships that would only be known after the prediction date, or if week-2 behavioural aggregates are made available to a model that is meant to predict before week 2, the evaluation may still be optimistic. Confirm the exact timing semantics in the dataset and aggregation code before making deployment claims.
 
-| Section | What happens | Output to look at |
-|---|---|---|
-| 0. Setup | Imports, PyTorch/CUDA check, configuration | Device printed |
-| 1. Inventory | Lists files, **prints the dataset `readme.md`** | Dataset documentation |
-| 2. Load | Reads `node.csv` / `edge.csv`, auto-detects columns | **Detection table (verify it!)** |
-| 3. IDs and labels | Unifies IDs, parses labels | Label counts |
-| 4. Relations | Encodes edge relations, removes self-loops | Edges per relation |
-| 5. Transactions | Streams the two order files, builds weekly per-user features, caches them | Feature summary |
-| 6. Sub-sample | Builds a manageable subgraph around random labelled users | Node/edge counts |
-| 7. Graph + EDA | De-duplicates edges, degrees, plots | Degree by label |
-| 8. Split | Temporal train / validation / test | Split table |
-| 9. Features | Combines everything into one matrix | Feature count |
-| 10. Naive Bayes | Fit and validate | Validation PR-AUC |
-| 11. GNN | Train with early stopping | Loss and PR-AUC curves |
-| 12. Ensemble | Choose weight, fit stacker | Weight plot |
-| 13. Evaluation | Test metrics, PR curves, confusion matrix | **The results table** |
-| 14. Interpretation | Feature effects, top suspicious users, missed abusers | What distinguishes abusers |
-| 15. Save | Writes everything to `outputs/` | Files list |
+## 6. Configuration guidance and practical run plan
 
----
+### First smoke test
 
-## 9. Leakage controls (what to say in a viva)
+Use small data limits to validate:
 
-Data leakage means information from the test set or from labels sneaks into training, inflating scores. This project guards against it:
+- Dataset paths
+- CSV parsing
+- Detected columns
+- Label values
+- Relation encoding
+- Transaction user-ID detection
+- Memory consumption
 
-* **No labels in features.** Neighbour *labels* are never used; only neighbour *features*.
-* **Scalers, quantile transformers and feature selection** are fitted on training nodes only.
-* **Threshold and ensemble weight** are chosen on validation only.
-* **Temporal split**, with users active in both weeks kept out of the test set.
-* **Week-specific features:** a test user's features come from the test week.
+A smoke test is a pipeline check only; do not present its metrics as final.
 
-One honest caveat: the graph is **transductive**. Test users are nodes in the same graph, so their features can flow to training neighbours during message passing. This is standard for node classification, but it is *not* the same as scoring a brand-new unseen user. State this in your report.
+### Full experiment
 
----
+After the smoke test:
 
-## 10. Glossary
+1. Remove row limits where resources allow.
+2. Decide whether the graph can fit in memory.
+3. Set `MAX_NODES` to a justified sample size or `None` for full graph.
+4. Keep `PRESERVE_PREVALENCE=True` when measuring realistic precision.
+5. Use the temporal split if the data supports it.
+6. Save the actual configuration with the results.
+7. Repeat runs if you need uncertainty estimates; one random seed is not a stability study.
 
-| Term | Meaning |
-|---|---|
-| **Node / edge** | A thing / a relationship between two things in a graph |
-| **Degree** | Number of neighbours a node has |
-| **Relation type** | The kind of connection (here `r1…r8`) |
-| **Homogeneous graph** | All nodes are the same type (users); relations are edge types |
-| **Message passing** | Each node updates its vector using its neighbours' vectors |
-| **GNN / GraphSAGE** | Neural network that learns on graphs by message passing; SAGE averages neighbours |
-| **Transductive** | The whole graph, including test nodes, is present during training (labels hidden) |
-| **Class imbalance** | One class (abusers) is much rarer than the other |
-| **PR-AUC** | Area under the precision-recall curve |
-| **Soft vote** | Averaging model scores rather than counting yes/no votes |
-| **Stacking** | Training a small model to combine other models' outputs |
-| **Data leakage** | Test or label information accidentally used in training |
-| **SKU** | Stock keeping unit, a product identifier |
-| **Stocking up / cashback abuse** | The two abuse behaviours described in the paper |
+### CUDA
 
----
+CUDA can accelerate the PyTorch GNN portion. It does not automatically move pandas, SciPy, scikit-learn or CSV aggregation to the GPU. The notebook's sparse adjacency tensors and GNN tensors are moved to the selected PyTorch device. Memory can still be a limiting factor.
 
-## 11. Things to confirm with the dataset's own `readme.md`
+## 7. Interpretation and responsible use
 
-Before submitting, check these and update the report:
+A high prediction score means the model found patterns associated with labelled abuse in this dataset. It does not prove that a particular user intentionally committed fraud.
 
-1. The exact names of `r1…r8`.
-2. The meaning and encoding of the label column in `node.csv`.
-3. Whether `edge.csv` is built from both weeks or one, and how edges were constructed (for example any time or distance windows).
-4. Whether `id` in the order files is the same ID space as `node.csv`.
-5. The dataset's license and citation requirements.
+Potential sources of error include:
 
----
+- Incorrect or incomplete labels
+- Shared relationships that have legitimate explanations
+- Users with few graph connections
+- Distribution changes between the two weeks
+- Subgraph sampling effects
+- Missing or malformed transaction records
+- Schema auto-detection mistakes
 
-*Source for the dataset and method: Li et al., "PromoGuardian: Detecting Promotion Abuse Fraud with Multi-Relation Fused Graph Neural Networks", arXiv:2510.12652. Dataset: <https://osf.io/rasje/>.*
+Use model scores to prioritise human review. Before operational use, define an appeal process, measure false-positive impact, assess privacy and legal requirements, and validate across time periods and user groups where appropriate.
+
+## 8. Current limitations and future improvements
+
+The notebook itself identifies these limitations and extensions:
+
+- Sampling to `MAX_NODES` thins the graph and changes the experiment.
+- Reported abuse labels may contain false negatives.
+- Full-batch GNN training does not scale to millions of nodes without neighbour sampling.
+- The model is a simplified relation-aware GraphSAGE implementation, not a complete reproduction of the published PromoGuardian system.
+- Temporal edge weights could represent changing relationships.
+- GAT-style attention could learn which neighbours matter most.
+- Neighbour sampling could support larger graphs.
+- Thresholds could be selected using the business cost of wrongly blocking a legitimate customer versus missing an abusive account.
+
+For a free-trial-abuse adaptation, the same general pattern may be investigated with carefully governed relationship signals such as shared devices, IP ranges, payment instruments or repeated account-creation patterns. Such signals can also connect legitimate users, so they require cautious interpretation and privacy review.
+
+## 9. Suggested viva / project explanation
+
+**Why use a graph?** Because accounts may look normal individually, while shared relationships reveal coordinated behaviour.
+
+**Why use relation-aware aggregation?** Different edge types can have different meanings. Separate aggregation lets the model learn from each type independently.
+
+**Why keep unlabelled nodes?** They can still provide neighbourhood information even though they do not contribute to supervised loss.
+
+**Why Naive Bayes?** It is a fast, simple baseline and gives a useful comparison against more complex models.
+
+**Why gradient boosting?** It learns non-linear interactions in behavioural and engineered graph features.
+
+**Why a GNN?** It learns representations by combining a user's own features with information from connected users.
+
+**Why an ensemble?** The models use different signals and assumptions. Combining their validation-calibrated ranks may improve ranking quality if their errors are complementary. The experiment must demonstrate that; an ensemble is not automatically better.
+
+**Why PR-AUC?** It is informative when the positive class is rare and focuses on the precision-recall trade-off.
+
+**Why temporal split?** It better approximates predicting future users from earlier data than a random split.
+
+**How is leakage reduced?** Train-only preprocessing, train-label-only neighbour features, training-only GNN loss, and validation-only model/threshold selection.
+
+**What is the main limitation?** The full-batch GNN and in-memory graph operations limit scale; sampling changes the graph, and reported labels may be incomplete.
+
+## 10. References and source of truth
+
+- Dataset: Meituan Public Promotion Abuse (PPA), associated with PromoGuardian: https://osf.io/rasje/
+- The dataset's own `readme.md` is the source of truth for CSV field definitions and relation semantics.
+- The notebook `promotion_abuse_2.ipynb` is the source of truth for the exact implementation, configuration defaults and exported artefacts.
+
+This document explains the notebook as uploaded. It does not claim that the code has been executed successfully on the full dataset or that any particular performance score has been achieved.
